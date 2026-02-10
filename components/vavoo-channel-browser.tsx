@@ -33,7 +33,7 @@ export default function VavooChannelBrowserUltra() {
   const [searchQuery, setSearchQuery] = useState('')
   const [playError, setPlayError] = useState<string | null>(null)
   const [bufferHealth, setBufferHealth] = useState<number>(0)
-  const [streamMode, setStreamMode] = useState<StreamMode>('cdn')
+  const [streamMode, setStreamMode] = useState<StreamMode>('standard')
   const [currentQuality, setCurrentQuality] = useState<string>('auto')
   
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -73,7 +73,7 @@ export default function VavooChannelBrowserUltra() {
   const retryCountRef = useRef(0)
   const maxNetworkRetries = 3
 
-  const playChannel = async (channel: Channel, mode: StreamMode = 'cdn') => {
+  const playChannel = async (channel: Channel, mode: StreamMode = 'standard') => {
     setSelectedChannel(channel)
     setPlayError(null)
     setBufferHealth(0)
@@ -83,9 +83,6 @@ export default function VavooChannelBrowserUltra() {
     try {
       const encodedUrl = encodeURIComponent(channel.url)
       const proxyUrl = `/api/vavoo-stream-v2?url=${encodedUrl}&mode=${mode}`
-
-      console.log(`[v0] Playing channel: ${channel.name}, mode: ${mode}`)
-      console.log(`[v0] Proxy URL: ${proxyUrl}`)
 
       if (videoRef.current) {
         if (Hls.isSupported()) {
@@ -98,105 +95,89 @@ export default function VavooChannelBrowserUltra() {
             enableWorker: true,
             lowLatencyMode: false,
 
-            // Buffer optimized
-            maxBufferLength: 30,
-            maxMaxBufferLength: 120,
-            maxBufferSize: 60 * 1000 * 1000,
+            // Smaller buffer for faster start
+            maxBufferLength: 20,
+            maxMaxBufferLength: 600,
+            maxBufferSize: 40 * 1000 * 1000,
             maxBufferHole: 0.5,
-            backBufferLength: 60,
 
             // Generous timeouts for proxy
-            manifestLoadingTimeOut: 20000,
-            manifestLoadingMaxRetry: 4,
-            manifestLoadingRetryDelay: 1000,
-            manifestLoadingMaxRetryTimeout: 30000,
+            manifestLoadingTimeOut: 30000,
+            manifestLoadingMaxRetry: 6,
+            manifestLoadingRetryDelay: 2000,
+            manifestLoadingMaxRetryTimeout: 60000,
 
-            levelLoadingTimeOut: 20000,
-            levelLoadingMaxRetry: 4,
-            levelLoadingRetryDelay: 1000,
-            levelLoadingMaxRetryTimeout: 30000,
+            levelLoadingTimeOut: 30000,
+            levelLoadingMaxRetry: 6,
+            levelLoadingRetryDelay: 2000,
+            levelLoadingMaxRetryTimeout: 60000,
 
-            fragLoadingTimeOut: 30000,
-            fragLoadingMaxRetry: 6,
-            fragLoadingRetryDelay: 1000,
-            fragLoadingMaxRetryTimeout: 60000,
+            fragLoadingTimeOut: 60000,
+            fragLoadingMaxRetry: 10,
+            fragLoadingRetryDelay: 2000,
+            fragLoadingMaxRetryTimeout: 64000,
 
             // Progressive loading
             progressive: true,
-            startFragPrefetch: true,
 
-            // ABR
-            startLevel: -1,
+            // Start at lowest quality for faster first frame
+            startLevel: 0,
             capLevelToPlayerSize: true,
-            abrEwmaDefaultEstimate: 500000,
-            abrBandWidthFactor: 0.90,
-            abrBandWidthUpFactor: 0.60,
-            abrMaxWithRealBitrate: false,
 
-            maxLoadingDelay: 4,
+            // One segment at a time to avoid congestion
+            maxLoadingDelay: 1,
 
             xhrSetup: (xhr) => {
-              xhr.timeout = 30000
+              xhr.timeout = 60000
               xhr.withCredentials = false
             },
           })
 
           hlsRef.current = hls
 
-          // Manifest loaded
-          hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
-            console.log(`[v0] Manifest parsed: ${data.levels.length} qualities`)
-            retryCountRef.current = 0 // Reset retry count on success
-            
-            videoRef.current?.play().catch((err) => {
-              console.error('[v0] Play error:', err)
+          // Manifest loaded - auto play
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            retryCountRef.current = 0
+            setPlayError(null)
+            videoRef.current?.play().catch(() => {
               setPlayError('Cliquez sur le lecteur pour demarrer')
             })
           })
 
           // Level switch
-          hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+          hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
             const level = hls.levels[data.level]
-            const quality = level ? `${level.width}x${level.height}` : 'unknown'
+            const quality = level ? `${level.width}x${level.height}` : 'auto'
             setCurrentQuality(quality)
           })
 
-          // Fragment loaded - reset error state on successful load
+          // Fragment loaded - reset error state
           hls.on(Hls.Events.FRAG_LOADED, () => {
-            if (playError) {
-              setPlayError(null)
-            }
+            if (playError) setPlayError(null)
             retryCountRef.current = 0
           })
 
-          // Error handling with auto-fallback between modes
-          hls.on(Hls.Events.ERROR, (event, data) => {
-            console.error('[v0] HLS Error:', {
-              type: data.type,
-              details: data.details,
-              fatal: data.fatal,
-            })
-
+          // Error handling with retry and auto-fallback
+          hls.on(Hls.Events.ERROR, (_event, data) => {
             if (data.fatal) {
               retryCountRef.current++
 
               switch (data.type) {
                 case Hls.ErrorTypes.NETWORK_ERROR:
                   if (retryCountRef.current <= maxNetworkRetries) {
-                    console.log(`[v0] Network error - retry ${retryCountRef.current}/${maxNetworkRetries}`)
-                    setPlayError(`Erreur reseau - tentative ${retryCountRef.current}/${maxNetworkRetries}...`)
+                    setPlayError(`Erreur reseau - reconnexion ${retryCountRef.current}/${maxNetworkRetries}...`)
                     setTimeout(() => {
                       hls.startLoad()
-                    }, 2000)
+                      setPlayError(null)
+                    }, 1000)
                   } else {
-                    // Auto-fallback to next mode
-                    const fallbackOrder: StreamMode[] = ['cdn', 'auth', 'standard']
+                    // Auto-fallback: standard -> auth -> cdn
+                    const fallbackOrder: StreamMode[] = ['standard', 'auth', 'cdn']
                     const currentIndex = fallbackOrder.indexOf(mode)
                     const nextMode = fallbackOrder[currentIndex + 1]
                     
                     if (nextMode) {
-                      console.log(`[v0] Falling back from ${mode} to ${nextMode}`)
-                      setPlayError(`Mode ${mode} echoue - passage au mode ${nextMode}...`)
+                      setPlayError(`Mode ${mode} echoue - test du mode ${nextMode}...`)
                       hls.destroy()
                       setTimeout(() => {
                         playChannel(channel, nextMode)
@@ -208,7 +189,6 @@ export default function VavooChannelBrowserUltra() {
                   break
 
                 case Hls.ErrorTypes.MEDIA_ERROR:
-                  console.log('[v0] Media error - recovering...')
                   setPlayError('Erreur media - recuperation...')
                   hls.recoverMediaError()
                   setTimeout(() => setPlayError(null), 2000)
@@ -332,8 +312,8 @@ export default function VavooChannelBrowserUltra() {
                     <div className="bg-slate-800 rounded-lg px-3 py-1.5">
                       <span className="text-xs text-slate-400">
                         {streamMode === 'cdn' && <><Zap className="w-3 h-3 inline mr-1 text-green-400" />CDN Direct</>}
-                        {streamMode === 'auth' && '🔐 Auth'}
-                        {streamMode === 'standard' && '📡 Standard'}
+                        {streamMode === 'auth' && 'Auth'}
+                        {streamMode === 'standard' && 'Standard'}
                       </span>
                     </div>
 
@@ -377,27 +357,29 @@ export default function VavooChannelBrowserUltra() {
                 {/* Mode selector */}
                 <div className="flex gap-2 flex-wrap">
                   <Button
+                    onClick={() => playChannel(selectedChannel, 'standard')}
+                    variant={streamMode === 'standard' ? 'default' : 'outline'}
+                    size="sm"
+                    className={streamMode === 'standard' ? 'bg-blue-600 hover:bg-blue-700' : ''}
+                  >
+                    Proxy Standard
+                  </Button>
+                  <Button
+                    onClick={() => playChannel(selectedChannel, 'auth')}
+                    variant={streamMode === 'auth' ? 'default' : 'outline'}
+                    size="sm"
+                    className={streamMode === 'auth' ? 'bg-blue-600 hover:bg-blue-700' : ''}
+                  >
+                    Proxy avec Auth
+                  </Button>
+                  <Button
                     onClick={() => playChannel(selectedChannel, 'cdn')}
                     variant={streamMode === 'cdn' ? 'default' : 'outline'}
                     size="sm"
                     className={streamMode === 'cdn' ? 'bg-green-600 hover:bg-green-700' : ''}
                   >
                     <Zap className="w-4 h-4 mr-2" />
-                    CDN Direct (Rapide)
-                  </Button>
-                  <Button
-                    onClick={() => playChannel(selectedChannel, 'auth')}
-                    variant={streamMode === 'auth' ? 'default' : 'outline'}
-                    size="sm"
-                  >
-                    Proxy avec Auth
-                  </Button>
-                  <Button
-                    onClick={() => playChannel(selectedChannel, 'standard')}
-                    variant={streamMode === 'standard' ? 'default' : 'outline'}
-                    size="sm"
-                  >
-                    Proxy Standard
+                    CDN Direct
                   </Button>
                 </div>
               </CardContent>
@@ -493,7 +475,7 @@ export default function VavooChannelBrowserUltra() {
                   {filteredChannels.map((channel) => (
                     <Button
                       key={channel.id}
-                      onClick={() => playChannel(channel, 'cdn')}
+                      onClick={() => playChannel(channel, 'standard')}
                       className="h-auto py-3 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-blue-500 transition-all justify-start"
                       variant="outline"
                     >

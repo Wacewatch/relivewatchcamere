@@ -192,7 +192,7 @@ export async function GET(request: NextRequest) {
         }
 
         const encodedUrl = encodeURIComponent(absoluteUrl)
-        return `${request.nextUrl.origin}/api/vavoo-stream?url=${encodedUrl}`
+        return `${request.nextUrl.origin}/api/vavoo-stream-v2?url=${encodedUrl}&mode=standard`
       })
 
       return new NextResponse(rewrittenLines.join('\n'), {

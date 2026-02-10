@@ -3,36 +3,23 @@ import { NextRequest, NextResponse } from 'next/server'
 export const runtime = 'edge'
 export const dynamic = 'force-dynamic'
 
-// Cache global pour les signatures et résolutions
-const cache = {
-  signature: null as { sig: string; exp: number } | null,
-  cdnUrls: new Map<string, { url: string; exp: number }>(),
-}
+// Cache pour stocker les signatures Vavoo
+let cachedSignature: { sig: string; timestamp: number } | null = null
+const SIGNATURE_CACHE_DURATION = 3600000 // 1 heure
 
-// Nettoyer le cache expiré
-function cleanExpiredCache() {
-  const now = Date.now()
-  if (cache.signature && cache.signature.exp < now) {
-    cache.signature = null
-  }
-  for (const [key, value] of cache.cdnUrls.entries()) {
-    if (value.exp < now) {
-      cache.cdnUrls.delete(key)
-    }
-  }
-}
+// Cache pour CDN resolved URLs
+const cdnCache = new Map<string, { url: string; exp: number }>()
 
-// Obtenir la signature Vavoo
 async function getVavooSignature(): Promise<string | null> {
-  cleanExpiredCache()
-
-  if (cache.signature && cache.signature.exp > Date.now()) {
-    return cache.signature.sig
+  // Verifier le cache
+  if (cachedSignature && Date.now() - cachedSignature.timestamp < SIGNATURE_CACHE_DURATION) {
+    return cachedSignature.sig
   }
 
+  const currentTime = Date.now()
   const payload = {
     token: '',
-    reason: 'app-start',
+    reason: 'app-blur',
     locale: 'de',
     theme: 'dark',
     metadata: {
@@ -72,8 +59,8 @@ async function getVavooSignature(): Promise<string | null> {
     package: 'tv.vavoo.app',
     version: '3.1.21',
     process: 'app',
-    firstAppStart: Date.now(),
-    lastAppStart: Date.now(),
+    firstAppStart: currentTime,
+    lastAppStart: currentTime,
     ipLocation: '',
     adblockEnabled: true,
     proxy: {
@@ -100,37 +87,32 @@ async function getVavooSignature(): Promise<string | null> {
     })
 
     if (!response.ok) {
-      console.log('[Auth] Ping failed:', response.status)
+      console.error('[Vavoo Auth] Ping failed:', response.status)
       return null
     }
 
     const data = await response.json()
-    const sig = data?.addonSig
+    const signature = data?.addonSig || null
 
-    if (sig) {
-      cache.signature = {
-        sig,
-        exp: Date.now() + 3600000, // 1h
-      }
-      console.log('[Auth] Signature obtained successfully')
+    if (signature) {
+      cachedSignature = { sig: signature, timestamp: Date.now() }
+      console.log('[Vavoo Auth] Signature obtained and cached')
     } else {
-      console.log('[Auth] No addonSig in response')
+      console.error('[Vavoo Auth] No addonSig in response')
     }
 
-    return sig
+    return signature
   } catch (error) {
-    console.error('[Auth] Error:', error)
+    console.error('[Vavoo Auth] Error:', error)
     return null
   }
 }
 
-// Résoudre l'URL Vavoo vers CDN direct
+// Resolve vavoo.to URL to CDN direct URL
 async function resolveVavooUrl(vavooUrl: string, signature: string): Promise<string | null> {
-  cleanExpiredCache()
-
-  const cached = cache.cdnUrls.get(vavooUrl)
+  // Check cache
+  const cached = cdnCache.get(vavooUrl)
   if (cached && cached.exp > Date.now()) {
-    console.log('[CDN] Using cached URL for:', vavooUrl.substring(0, 60))
     return cached.url
   }
 
@@ -155,7 +137,7 @@ async function resolveVavooUrl(vavooUrl: string, signature: string): Promise<str
     })
 
     if (!response.ok) {
-      console.error('[CDN] Resolve failed:', response.status)
+      console.error('[CDN Resolve] Failed:', response.status)
       return null
     }
 
@@ -169,29 +151,14 @@ async function resolveVavooUrl(vavooUrl: string, signature: string): Promise<str
     }
 
     if (cdnUrl) {
-      cache.cdnUrls.set(vavooUrl, {
-        url: cdnUrl,
-        exp: Date.now() + 1800000, // 30min
-      })
-      console.log('[CDN] Resolved to:', cdnUrl.substring(0, 80))
-    } else {
-      console.log('[CDN] No URL in resolve response:', JSON.stringify(result).substring(0, 200))
+      cdnCache.set(vavooUrl, { url: cdnUrl, exp: Date.now() + 1800000 })
+      console.log('[CDN Resolve] OK:', cdnUrl.substring(0, 80))
     }
 
     return cdnUrl
   } catch (error) {
-    console.error('[CDN] Resolve error:', error)
+    console.error('[CDN Resolve] Error:', error)
     return null
-  }
-}
-
-// Determine if a URL is a vavoo.to URL that needs resolution
-function isVavooUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url)
-    return parsed.hostname.includes('vavoo.to')
-  } catch {
-    return false
   }
 }
 
@@ -213,67 +180,60 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid URL' }, { status: 400 })
     }
 
+    // Always get signature - needed for ALL vavoo.to requests
+    const signature = await getVavooSignature()
+
     let finalUrl = targetUrl
+    let useVavooHeaders = true
+
+    // Check if this is a vavoo.to URL
+    const isVavoo = (() => {
+      try {
+        return new URL(targetUrl).hostname.includes('vavoo.to')
+      } catch {
+        return false
+      }
+    })()
+
+    // Mode CDN: try to resolve vavoo.to URLs to direct CDN
+    if (mode === 'cdn' && isVavoo && signature) {
+      const cdnUrl = await resolveVavooUrl(targetUrl, signature)
+      if (cdnUrl) {
+        finalUrl = cdnUrl
+        useVavooHeaders = false // CDN URLs don't need vavoo headers
+      } else {
+        // CDN resolve failed - fall back to direct proxy with signature
+        console.log('[CDN] Resolve failed, falling back to direct proxy with auth')
+      }
+    }
+
+    // For non-vavoo URLs (CDN segments), don't use vavoo headers
+    if (!isVavoo) {
+      useVavooHeaders = false
+    }
+
+    // Build headers
     const headers: Record<string, string> = {
-      'User-Agent': 'VAVOO/2.6',
+      'User-Agent': useVavooHeaders ? 'VAVOO/2.6' : 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
       'Accept': '*/*',
       'Connection': 'keep-alive',
       'Accept-Encoding': 'gzip, deflate',
     }
 
-    const isVavoo = isVavooUrl(targetUrl)
-
-    // Mode CDN Direct - Only resolve vavoo.to URLs, pass CDN URLs through directly
-    if (mode === 'cdn') {
-      if (isVavoo) {
-        // This is a vavoo.to URL - resolve it to CDN
-        const signature = await getVavooSignature()
-        if (!signature) {
-          console.error('[CDN] Failed to get signature for:', targetUrl.substring(0, 60))
-          return NextResponse.json({ error: 'Auth failed' }, { status: 502 })
-        }
-
-        const cdnUrl = await resolveVavooUrl(targetUrl, signature)
-        if (!cdnUrl) {
-          console.error('[CDN] Failed to resolve:', targetUrl.substring(0, 60))
-          return NextResponse.json({ error: 'CDN resolve failed' }, { status: 502 })
-        }
-
-        finalUrl = cdnUrl
-        // CDN URLs don't need vavoo-specific headers
-        delete headers['mediahubmx-signature']
-      } else {
-        // This is already a CDN URL (segment from resolved manifest) - fetch directly
-        // Use generic headers for CDN
-        headers['User-Agent'] = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
-      }
-    }
-    // Mode with Auth - Add signature to all vavoo.to requests
-    else if (mode === 'auth') {
-      if (isVavoo) {
-        const signature = await getVavooSignature()
-        if (signature) {
-          headers['mediahubmx-signature'] = signature
-        }
-      }
-    }
-    // Standard mode - proxy with vavoo headers for vavoo.to URLs
-    // For non-vavoo URLs, use generic headers
-    else if (!isVavoo) {
-      headers['User-Agent'] = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+    // ALWAYS add signature for vavoo.to URLs (this is the key fix!)
+    if (isVavoo && signature && useVavooHeaders) {
+      headers['mediahubmx-signature'] = signature
     }
 
-    // Range support
+    // Range support for seeking
     const rangeHeader = request.headers.get('range')
     if (rangeHeader) {
       headers['Range'] = rangeHeader
     }
 
-    // Fetch with optimized timeout
+    // Fetch with timeout
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 25000)
-
-    console.log(`[Fetch] ${mode} | ${isVavoo ? 'vavoo' : 'cdn'} | ${finalUrl.substring(0, 80)}`)
+    const timeoutId = setTimeout(() => controller.abort(), 30000)
 
     const response = await fetch(finalUrl, {
       headers,
@@ -281,39 +241,18 @@ export async function GET(request: NextRequest) {
       signal: controller.signal,
     }).finally(() => clearTimeout(timeoutId))
 
+    // Handle errors
     if (!response.ok && response.status !== 206) {
-      console.error(`[Fetch] Error ${response.status} for: ${finalUrl.substring(0, 80)}`)
-      // For segments, try without custom headers as fallback
-      if (!finalUrl.includes('.m3u8') && response.status === 403) {
-        console.log('[Fetch] Retrying with minimal headers...')
-        const retryResponse = await fetch(finalUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-            'Accept': '*/*',
-          },
-          redirect: 'follow',
-        })
-        if (retryResponse.ok || retryResponse.status === 206) {
-          const ct = retryResponse.headers.get('content-type') || 'video/MP2T'
-          return new NextResponse(retryResponse.body, {
-            status: retryResponse.status,
-            headers: {
-              'Content-Type': ct,
-              'Access-Control-Allow-Origin': '*',
-              'Cache-Control': 'public, max-age=31536000, immutable',
-            },
-          })
-        }
-      }
+      console.error(`[Stream] Error ${response.status} for: ${finalUrl.substring(0, 100)}`)
       return NextResponse.json(
-        { error: `Fetch error: ${response.status}` },
+        { error: `Stream error: ${response.status}` },
         { status: response.status }
       )
     }
 
     const contentType = response.headers.get('content-type') || ''
 
-    // M3U8 manifest processing
+    // M3U8 manifest processing - rewrite URLs to proxy through us
     if (
       contentType.includes('mpegurl') ||
       contentType.includes('m3u8') ||
@@ -321,7 +260,6 @@ export async function GET(request: NextRequest) {
       targetUrl.includes('.m3u8')
     ) {
       const text = await response.text()
-      console.log(`[M3U8] Processing manifest (${text.length} bytes), mode=${mode}`)
 
       const baseUrl = new URL(finalUrl)
       const pathParts = baseUrl.pathname.split('/')
@@ -346,11 +284,8 @@ export async function GET(request: NextRequest) {
         }
 
         const encodedUrl = encodeURIComponent(absoluteUrl)
-
-        // In CDN mode: if the resolved manifest points to CDN segments,
-        // still proxy them but they won't need resolution since they're not vavoo.to URLs
-        const segmentMode = mode === 'cdn' ? '&mode=cdn' : mode === 'auth' ? '&mode=auth' : ''
-        return `${request.nextUrl.origin}/api/vavoo-stream-v2?url=${encodedUrl}${segmentMode}`
+        // Keep the same mode for sub-requests (segments, sub-playlists)
+        return `${request.nextUrl.origin}/api/vavoo-stream-v2?url=${encodedUrl}&mode=${mode}`
       })
 
       return new NextResponse(rewrittenLines.join('\n'), {
@@ -360,7 +295,7 @@ export async function GET(request: NextRequest) {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, OPTIONS',
           'Access-Control-Allow-Headers': 'Range, User-Agent, Content-Type',
-          'Cache-Control': 'no-cache, no-store',
+          'Cache-Control': 'public, max-age=10',
         },
       })
     }
@@ -373,14 +308,16 @@ export async function GET(request: NextRequest) {
       'Access-Control-Allow-Headers': 'Range, User-Agent, Content-Type',
       'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
       'Accept-Ranges': 'bytes',
-      'Cache-Control': 'public, max-age=31536000, immutable',
+      'Cache-Control': 'public, max-age=86400',
     }
 
     const contentLength = response.headers.get('content-length')
     const contentRange = response.headers.get('content-range')
+    const acceptRanges = response.headers.get('accept-ranges')
 
     if (contentLength) responseHeaders['Content-Length'] = contentLength
     if (contentRange) responseHeaders['Content-Range'] = contentRange
+    if (acceptRanges) responseHeaders['Accept-Ranges'] = acceptRanges
 
     return new NextResponse(response.body, {
       status: response.status,
@@ -388,7 +325,6 @@ export async function GET(request: NextRequest) {
     })
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      console.error('[Stream] Timeout')
       return NextResponse.json({ error: 'Request timeout' }, { status: 504 })
     }
     console.error('[Stream] Error:', error)
