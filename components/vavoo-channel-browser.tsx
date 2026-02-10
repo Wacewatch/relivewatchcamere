@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Globe, Tv, Loader2, AlertCircle, Play, Search, ArrowLeft, Signal } from 'lucide-react'
+import { Globe, Tv, Loader2, AlertCircle, Play, Search, ArrowLeft, Signal, Zap } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import Hls from 'hls.js'
 
@@ -22,7 +22,9 @@ interface Country {
   channels: Channel[]
 }
 
-export default function VavooChannelBrowser() {
+type StreamMode = 'standard' | 'auth' | 'cdn'
+
+export default function VavooChannelBrowserUltra() {
   const [countries, setCountries] = useState<Country[]>([])
   const [selectedCountry, setSelectedCountry] = useState<Country | null>(null)
   const [selectedChannel, setSelectedChannel] = useState<Channel | null>(null)
@@ -31,6 +33,8 @@ export default function VavooChannelBrowser() {
   const [searchQuery, setSearchQuery] = useState('')
   const [playError, setPlayError] = useState<string | null>(null)
   const [bufferHealth, setBufferHealth] = useState<number>(0)
+  const [streamMode, setStreamMode] = useState<StreamMode>('cdn')
+  const [currentQuality, setCurrentQuality] = useState<string>('auto')
   
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
@@ -66,14 +70,15 @@ export default function VavooChannelBrowser() {
     }
   }
 
-  const playChannel = async (channel: Channel) => {
+  const playChannel = async (channel: Channel, mode: StreamMode = 'cdn') => {
     setSelectedChannel(channel)
     setPlayError(null)
     setBufferHealth(0)
+    setStreamMode(mode)
 
     try {
       const encodedUrl = encodeURIComponent(channel.url)
-      const proxyUrl = `/api/vavoo-stream?url=${encodedUrl}`
+      const proxyUrl = `/api/vavoo-stream-v2?url=${encodedUrl}&mode=${mode}`
 
       if (videoRef.current) {
         if (Hls.isSupported()) {
@@ -84,75 +89,103 @@ export default function VavooChannelBrowser() {
           const hls = new Hls({
             debug: false,
             enableWorker: true,
-            
-            // Buffer optimisé
-            maxBufferLength: 30,
-            maxMaxBufferLength: 90,
-            maxBufferSize: 60 * 1000 * 1000,
-            maxBufferHole: 0.5,
-            
-            // Loading optimisé
-            manifestLoadingTimeOut: 20000,
-            manifestLoadingMaxRetry: 4,
-            manifestLoadingRetryDelay: 1000,
-            
-            levelLoadingTimeOut: 20000,
-            levelLoadingMaxRetry: 4,
-            levelLoadingRetryDelay: 1000,
-            
-            fragLoadingTimeOut: 30000,
+            lowLatencyMode: false,
+
+            // Buffer ultra-optimisé
+            maxBufferLength: 40,              // 40s buffer
+            maxMaxBufferLength: 120,          // Max 120s
+            maxBufferSize: 100 * 1000 * 1000, // 100 MB
+            maxBufferHole: 0.3,
+            backBufferLength: 120,
+
+            // Loading très rapide
+            manifestLoadingTimeOut: 10000,
+            manifestLoadingMaxRetry: 3,
+            manifestLoadingRetryDelay: 500,
+            manifestLoadingMaxRetryTimeout: 10000,
+
+            levelLoadingTimeOut: 10000,
+            levelLoadingMaxRetry: 3,
+            levelLoadingRetryDelay: 500,
+            levelLoadingMaxRetryTimeout: 10000,
+
+            fragLoadingTimeOut: 20000,
             fragLoadingMaxRetry: 6,
-            fragLoadingRetryDelay: 1000,
-            
-            // Progressive loading
+            fragLoadingRetryDelay: 500,
+            fragLoadingMaxRetryTimeout: 60000,
+
+            // Progressive et prefetch
             progressive: true,
-            
-            // Auto quality
+            startFragPrefetch: true,
+
+            // ABR optimisé
             startLevel: -1,
             capLevelToPlayerSize: true,
-            
-            // ABR
-            abrEwmaDefaultEstimate: 500000,
-            abrBandWidthFactor: 0.95,
-            abrBandWidthUpFactor: 0.7,
-            
-            // Fragmentation
-            backBufferLength: 90,
-            
+            abrEwmaDefaultEstimate: 1000000,  // Assume 1 Mbps initially
+            abrBandWidthFactor: 0.90,
+            abrBandWidthUpFactor: 0.60,
+            abrMaxWithRealBitrate: false,
+
+            // Parallélisation
+            maxLoadingDelay: 2,
+
             xhrSetup: (xhr) => {
-              xhr.timeout = 30000
+              xhr.timeout = 20000
+              xhr.withCredentials = false
             },
           })
 
           hlsRef.current = hls
 
-          // Event: Manifest loaded
-          hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            console.log('[HLS] Manifest parsed, starting playback')
+          // Manifest loaded
+          hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+            console.log(`[HLS] Manifest: ${data.levels.length} qualities`)
+            data.levels.forEach((level, i) => {
+              console.log(`  Level ${i}: ${level.width}x${level.height} @ ${(level.bitrate / 1000).toFixed(0)}kbps`)
+            })
+            
             videoRef.current?.play().catch((err) => {
-              console.error('[HLS] Play error:', err)
-              setPlayError('Cliquez sur play pour démarrer')
+              console.error('[Play] Error:', err)
+              setPlayError('Cliquez sur ▶ pour démarrer')
             })
           })
 
-          // Event: Level loaded
-          hls.on(Hls.Events.LEVEL_LOADED, (event, data) => {
-            console.log(`[HLS] Level ${data.level} loaded with ${data.details.fragments.length} fragments`)
+          // Level switch
+          hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+            const level = hls.levels[data.level]
+            const quality = level ? `${level.width}x${level.height}` : 'unknown'
+            setCurrentQuality(quality)
+            console.log(`[Quality] Switched to ${quality}`)
           })
 
-          // Event: Fragment loaded
+          // Fragment loaded
+          let loadCount = 0
+          let totalLoadTime = 0
           hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
-            console.log(`[HLS] Fragment loaded: ${data.frag.sn}, duration: ${data.frag.duration.toFixed(2)}s`)
+            loadCount++
+            totalLoadTime += data.stats.loading.end - data.stats.loading.start
+            const avgLoadTime = totalLoadTime / loadCount
+
+            console.log(
+              `[Frag ${data.frag.sn}] ` +
+              `${(data.stats.total / 1024).toFixed(1)}KB in ` +
+              `${(data.stats.loading.end - data.stats.loading.start).toFixed(0)}ms ` +
+              `(avg: ${avgLoadTime.toFixed(0)}ms)`
+            )
           })
 
-          // Event: Errors
+          // Errors avec récupération intelligente
           hls.on(Hls.Events.ERROR, (event, data) => {
-            console.error('[HLS] Error:', data.type, data.details, data.fatal)
+            console.error('[HLS] Error:', {
+              type: data.type,
+              details: data.details,
+              fatal: data.fatal,
+            })
 
             if (data.fatal) {
               switch (data.type) {
                 case Hls.ErrorTypes.NETWORK_ERROR:
-                  console.log('[HLS] Network error, attempting recovery...')
+                  console.log('[Recovery] Network error - retrying...')
                   setPlayError('Erreur réseau - reconnexion...')
                   setTimeout(() => {
                     hls.startLoad()
@@ -161,14 +194,15 @@ export default function VavooChannelBrowser() {
                   break
 
                 case Hls.ErrorTypes.MEDIA_ERROR:
-                  console.log('[HLS] Media error, attempting recovery...')
+                  console.log('[Recovery] Media error - recovering...')
                   setPlayError('Erreur média - récupération...')
                   hls.recoverMediaError()
                   setTimeout(() => setPlayError(null), 2000)
                   break
 
                 default:
-                  setPlayError(`Erreur: ${data.details}`)
+                  setPlayError(`Erreur fatale: ${data.details}`)
+                  console.error('[Fatal]', data)
                   break
               }
             }
@@ -180,13 +214,13 @@ export default function VavooChannelBrowser() {
           }
 
           bufferCheckInterval.current = setInterval(() => {
-            if (videoRef.current) {
+            if (videoRef.current && !videoRef.current.paused) {
               const buffered = videoRef.current.buffered
               if (buffered.length > 0) {
                 const bufferEnd = buffered.end(buffered.length - 1)
                 const currentTime = videoRef.current.currentTime
                 const bufferAhead = bufferEnd - currentTime
-                setBufferHealth(Math.min(100, (bufferAhead / 10) * 100))
+                setBufferHealth(Math.min(100, (bufferAhead / 20) * 100))
               }
             }
           }, 500)
@@ -195,7 +229,6 @@ export default function VavooChannelBrowser() {
           hls.attachMedia(videoRef.current)
 
         } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
-          // Native HLS support (Safari)
           videoRef.current.src = proxyUrl
           videoRef.current.play().catch(() => {
             setPlayError('Erreur de lecture')
@@ -209,23 +242,10 @@ export default function VavooChannelBrowser() {
 
   const getCountryFlagUrl = (countryCode: string): string => {
     const codeMap: Record<string, string> = {
-      'albania': 'al',
-      'arabia': 'sa',
-      'balkans': 'eu',
-      'bulgaria': 'bg',
-      'france': 'fr',
-      'germany': 'de',
-      'italy': 'it',
-      'netherlands': 'nl',
-      'poland': 'pl',
-      'portugal': 'pt',
-      'romania': 'ro',
-      'russia': 'ru',
-      'spain': 'es',
-      'turkey': 'tr',
-      'united_kingdom': 'gb',
-      'united kingdom': 'gb',
-      'uk': 'gb',
+      'albania': 'al', 'arabia': 'sa', 'balkans': 'eu', 'bulgaria': 'bg',
+      'france': 'fr', 'germany': 'de', 'italy': 'it', 'netherlands': 'nl',
+      'poland': 'pl', 'portugal': 'pt', 'romania': 'ro', 'russia': 'ru',
+      'spain': 'es', 'turkey': 'tr', 'united_kingdom': 'gb', 'uk': 'gb',
     }
     const iso = codeMap[countryCode.toLowerCase()] || countryCode.toLowerCase()
     return `https://flagcdn.com/w80/${iso}.png`
@@ -267,36 +287,50 @@ export default function VavooChannelBrowser() {
           {selectedChannel && (
             <Card className="bg-slate-900/50 border-slate-800 backdrop-blur">
               <CardHeader>
-                <div className="flex items-center justify-between">
-                  <div className="space-y-1 flex-1">
+                <div className="flex items-center justify-between flex-wrap gap-4">
+                  <div className="space-y-1 flex-1 min-w-0">
                     <CardTitle className="text-white flex items-center gap-2">
-                      <Play className="w-5 h-5 text-blue-400" />
-                      {selectedChannel.name}
+                      <Play className="w-5 h-5 text-blue-400 flex-shrink-0" />
+                      <span className="truncate">{selectedChannel.name}</span>
                     </CardTitle>
                     <CardDescription className="text-slate-400">
-                      {selectedCountry?.name}
+                      {selectedCountry?.name} • {currentQuality}
                     </CardDescription>
                   </div>
                   
-                  {/* Buffer Health Indicator */}
-                  <div className="flex items-center gap-3">
-                    <div className="flex items-center gap-2">
-                      <Signal className={`w-4 h-4 ${bufferHealth > 50 ? 'text-green-400' : bufferHealth > 20 ? 'text-yellow-400' : 'text-red-400'}`} />
-                      <span className="text-sm text-slate-400">
-                        Buffer: {bufferHealth.toFixed(0)}%
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {/* Buffer indicator */}
+                    <div className="flex items-center gap-2 bg-slate-800 rounded-lg px-3 py-1.5">
+                      <Signal
+                        className={`w-4 h-4 ${
+                          bufferHealth > 70
+                            ? 'text-green-400'
+                            : bufferHealth > 30
+                            ? 'text-yellow-400'
+                            : 'text-red-400'
+                        }`}
+                      />
+                      <span className="text-sm text-slate-300 font-mono">
+                        {bufferHealth.toFixed(0)}%
                       </span>
                     </div>
+
+                    {/* Mode indicator */}
+                    <div className="bg-slate-800 rounded-lg px-3 py-1.5">
+                      <span className="text-xs text-slate-400">
+                        {streamMode === 'cdn' && <><Zap className="w-3 h-3 inline mr-1 text-green-400" />CDN Direct</>}
+                        {streamMode === 'auth' && '🔐 Auth'}
+                        {streamMode === 'standard' && '📡 Standard'}
+                      </span>
+                    </div>
+
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => {
                         setSelectedChannel(null)
-                        if (hlsRef.current) {
-                          hlsRef.current.destroy()
-                        }
-                        if (bufferCheckInterval.current) {
-                          clearInterval(bufferCheckInterval.current)
-                        }
+                        if (hlsRef.current) hlsRef.current.destroy()
+                        if (bufferCheckInterval.current) clearInterval(bufferCheckInterval.current)
                       }}
                       className="bg-slate-800 border-slate-700 text-white hover:bg-slate-700"
                     >
@@ -325,6 +359,33 @@ export default function VavooChannelBrowser() {
                   >
                     Votre navigateur ne supporte pas la lecture vidéo.
                   </video>
+                </div>
+
+                {/* Mode selector */}
+                <div className="flex gap-2 flex-wrap">
+                  <Button
+                    onClick={() => playChannel(selectedChannel, 'cdn')}
+                    variant={streamMode === 'cdn' ? 'default' : 'outline'}
+                    size="sm"
+                    className={streamMode === 'cdn' ? 'bg-green-600 hover:bg-green-700' : ''}
+                  >
+                    <Zap className="w-4 h-4 mr-2" />
+                    CDN Direct (Rapide)
+                  </Button>
+                  <Button
+                    onClick={() => playChannel(selectedChannel, 'auth')}
+                    variant={streamMode === 'auth' ? 'default' : 'outline'}
+                    size="sm"
+                  >
+                    Proxy avec Auth
+                  </Button>
+                  <Button
+                    onClick={() => playChannel(selectedChannel, 'standard')}
+                    variant={streamMode === 'standard' ? 'default' : 'outline'}
+                    size="sm"
+                  >
+                    Proxy Standard
+                  </Button>
                 </div>
               </CardContent>
             </Card>
@@ -404,7 +465,6 @@ export default function VavooChannelBrowser() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-4">
-                {/* Search */}
                 <div className="relative">
                   <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
                   <Input
@@ -416,12 +476,11 @@ export default function VavooChannelBrowser() {
                   />
                 </div>
 
-                {/* Channels Grid */}
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 max-h-[600px] overflow-y-auto pr-2">
                   {filteredChannels.map((channel) => (
                     <Button
                       key={channel.id}
-                      onClick={() => playChannel(channel)}
+                      onClick={() => playChannel(channel, 'cdn')}
                       className="h-auto py-3 bg-slate-800 hover:bg-slate-700 border border-slate-700 hover:border-blue-500 transition-all justify-start"
                       variant="outline"
                     >
