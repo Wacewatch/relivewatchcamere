@@ -49,7 +49,7 @@ interface ProxyLog {
   data?: unknown;
 }
 
-type ProxyMode = "standard" | "auth" | "direct-cdn";
+type ProxyMode = "standard" | "auth" | "direct-cdn" | "no-proxy";
 
 export default function VavooChannelBrowser() {
   const [countries, setCountries] = useState<Country[]>([]);
@@ -164,6 +164,29 @@ export default function VavooChannelBrowser() {
         const cdnUrl = response.headers.get("X-CDN-URL") || "unknown";
         const resolveDuration = response.headers.get("X-Resolve-Duration") || "?";
         addLog("success", `CDN resolved in ${resolveDuration}ms | CDN: ${cdnUrl}`);
+      } else if (proxyMode === "no-proxy") {
+        addLog("info", "Calling /api/vavoo/no-proxy (DIRECT CDN - NO PROXY)...");
+        const response = await fetch("/api/vavoo/no-proxy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: channel.url }),
+        });
+
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({ error: "Unknown" }));
+          addLog("error", `No-proxy failed: ${data.error}`, data.debug);
+          throw new Error(data.error || "No-proxy failed");
+        }
+
+        // Returns m3u8 with absolute CDN URLs - create blob URL
+        const m3u8Text = await response.text();
+        const blob = new Blob([m3u8Text], { type: "application/vnd.apple.mpegurl" });
+        proxyUrl = URL.createObjectURL(blob);
+        
+        const cdnUrl = response.headers.get("X-CDN-URL") || "unknown";
+        const resolveDuration = response.headers.get("X-Resolve-Duration") || "?";
+        addLog("success", `No-proxy ready in ${resolveDuration}ms | All segments load DIRECT from CDN!`);
+        addLog("info", `CDN base: ${cdnUrl}`);
       } else if (proxyMode === "auth") {
         addLog("info", "Calling /api/vavoo/auth-stream (MediaHubMX UA + signature)...");
         const response = await fetch("/api/vavoo/auth-stream", {
@@ -382,6 +405,7 @@ export default function VavooChannelBrowser() {
                           {activeProxy === "standard" && "Standard"}
                           {activeProxy === "auth" && "Auth"}
                           {activeProxy === "direct-cdn" && "CDN Direct"}
+                          {activeProxy === "no-proxy" && "No Proxy"}
                         </span>
                       )}
                     </CardDescription>
@@ -443,6 +467,15 @@ export default function VavooChannelBrowser() {
                   >
                     <Rocket className="w-4 h-4 mr-2" />
                     CDN Direct (Rapide)
+                  </Button>
+                  <Button
+                    onClick={() => playChannel(selectedChannel, "no-proxy")}
+                    variant="outline"
+                    size="sm"
+                    className={`bg-transparent border-purple-700 hover:bg-purple-800 text-purple-200 ${activeProxy === "no-proxy" ? "bg-purple-800 border-purple-400" : "bg-purple-900/50"}`}
+                  >
+                    <Zap className="w-4 h-4 mr-2" />
+                    No Proxy (Ultra Rapide)
                   </Button>
                 </div>
 
