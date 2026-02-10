@@ -131,11 +131,93 @@ async function resolveUrl(url, signature) {
   return null;
 }
 
-// Run test
+async function testDirect(url, sig) {
+  // Test: Maybe the signature itself IS the key to get the stream directly
+  // and vavoo.to/play URLs already ARE the final URLs, just need proper headers
+  console.log(`\nStep 3: Testing direct fetch of m3u8 with signature header...`);
+  const start = Date.now();
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": "MediaHubMX/2",
+      "mediahubmx-signature": sig,
+      "Accept": "*/*",
+    },
+    redirect: "follow",
+  });
+  console.log(`  Status: ${resp.status} (${Date.now() - start}ms)`);
+  console.log(`  Final URL: ${resp.url}`);
+  console.log(`  Headers: content-type=${resp.headers.get("content-type")}, content-length=${resp.headers.get("content-length")}`);
+  const text = await resp.text();
+  console.log(`  Body (first 500 chars): ${text.substring(0, 500)}`);
+  return text;
+}
+
+async function testWithVavooUA(url) {
+  // Test: Just use VAVOO/2.6 user agent directly
+  console.log(`\nStep 4: Testing direct fetch with VAVOO/2.6 UA (no proxy)...`);
+  const start = Date.now();
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": "VAVOO/2.6",
+      "Accept": "*/*",
+    },
+    redirect: "follow",
+  });
+  console.log(`  Status: ${resp.status} (${Date.now() - start}ms)`);
+  console.log(`  Final URL: ${resp.url}`);
+  console.log(`  Headers: content-type=${resp.headers.get("content-type")}, content-length=${resp.headers.get("content-length")}`);
+  const text = await resp.text();
+  console.log(`  Body (first 500 chars): ${text.substring(0, 500)}`);
+  
+  // Parse the m3u8 to understand what URLs are in it
+  const lines = text.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  console.log(`\n  Segment/playlist URLs found: ${lines.length}`);
+  lines.slice(0, 3).forEach(l => console.log(`    ${l}`));
+  return text;
+}
+
+async function testResolveEndpoints(url, sig) {
+  // Test different resolve endpoints
+  const endpoints = [
+    "https://vavoo.to/mediahubmx-resolve.json",
+    "https://www.vavoo.tv/mediahubmx-resolve.json",
+    "https://vavoo.to/api/resolve",
+  ];
+  
+  for (const endpoint of endpoints) {
+    console.log(`\nTesting endpoint: ${endpoint}`);
+    const start = Date.now();
+    try {
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "User-Agent": "MediaHubMX/2",
+          "Accept": "application/json",
+          "Content-Type": "application/json; charset=utf-8",
+          "mediahubmx-signature": sig,
+        },
+        body: JSON.stringify({
+          language: "de",
+          region: "AT",
+          url: url,
+          clientVersion: "3.1.21",
+        }),
+      });
+      console.log(`  Status: ${resp.status} (${Date.now() - start}ms)`);
+      const text = await resp.text();
+      console.log(`  Body: ${text.substring(0, 300)}`);
+    } catch (e) {
+      console.log(`  Error: ${e.message}`);
+    }
+  }
+}
+
 const testUrl = "https://vavoo.to/play/1975426357/index.m3u8"; // FOOT+
 
 async function main() {
-  console.log("=== Vavoo Resolve Test ===\n");
+  console.log("=== Vavoo Deep Debug Test ===\n");
   
   const sig = await getSignature();
   if (!sig) {
@@ -143,15 +225,14 @@ async function main() {
     return;
   }
 
-  const resolved = await resolveUrl(testUrl, sig);
-  if (!resolved) {
-    console.log("\nFailed to resolve URL. Exiting.");
-    return;
-  }
-
-  console.log(`\n=== SUCCESS ===`);
-  console.log(`Original: ${testUrl}`);
-  console.log(`Resolved: ${resolved}`);
+  // Test 1: Direct fetch with signature
+  await testDirect(testUrl, sig);
+  
+  // Test 2: Direct fetch with VAVOO UA
+  await testWithVavooUA(testUrl);
+  
+  // Test 3: Different resolve endpoints  
+  await testResolveEndpoints(testUrl, sig);
 }
 
 main().catch(console.error);

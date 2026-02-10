@@ -3,14 +3,15 @@ import { NextRequest, NextResponse } from "next/server";
 export const runtime = "edge";
 
 /**
- * Auth-stream proxy: Same as standard proxy but adds the Vavoo signature
- * as a mediahubmx-signature header to all segment requests.
- * This is for testing whether the signature helps with stream quality
- * WITHOUT resolving to a different CDN URL.
+ * Auth-stream proxy: Uses MediaHubMX/2 user-agent with the signature header
+ * to resolve the CDN URL. This is different from "standard" (VAVOO/2.6 UA)
+ * and "direct-cdn" (VAVOO/2.6 resolve + return m3u8 directly).
+ * 
+ * This tests whether using MediaHubMX UA gives different/better CDN routes.
  */
+
 async function getVavooSignature(): Promise<string | null> {
   const currentTime = Date.now();
-
   const payload = {
     token: "",
     reason: "app-blur",
@@ -80,7 +81,6 @@ async function getVavooSignature(): Promise<string | null> {
       },
       body: JSON.stringify(payload),
     });
-
     if (!response.ok) return null;
     const data = await response.json();
     return data?.addonSig || null;
@@ -90,30 +90,94 @@ async function getVavooSignature(): Promise<string | null> {
 }
 
 export async function POST(request: NextRequest) {
+  const totalStart = Date.now();
+
   try {
     const { url } = await request.json();
-
     if (!url || typeof url !== "string") {
       return NextResponse.json({ error: "URL is required" }, { status: 400 });
     }
 
-    // Get signature
+    // Get signature for MediaHubMX auth
     const signature = await getVavooSignature();
+    const sigDuration = Date.now() - totalStart;
 
-    // Create proxified URL - pass signature as mediahubmx-signature via custom header param
-    const baseUrl = request.nextUrl.origin;
-    const params = new URLSearchParams();
-    params.set("url", encodeURIComponent(url));
-    // Use MediaHubMX user-agent when we have a signature
+    // Build headers for resolving - use MediaHubMX UA + signature
+    const resolveHeaders: Record<string, string> = {
+      "User-Agent": signature ? "MediaHubMX/2" : "VAVOO/2.6",
+      "Accept": "*/*",
+    };
     if (signature) {
-      params.set("ua", "MediaHubMX/2");
+      resolveHeaders["mediahubmx-signature"] = signature;
     }
 
-    const proxyUrl = `${baseUrl}/api/stream?${params.toString()}`;
+    // Resolve the CDN URL by following redirects
+    const resolveStart = Date.now();
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: resolveHeaders,
+      redirect: "follow",
+    });
 
-    return NextResponse.json({
-      proxyUrl,
-      hasSignature: !!signature,
+    const resolveDuration = Date.now() - resolveStart;
+
+    if (!resp.ok) {
+      return NextResponse.json(
+        { error: `Auth resolve failed: ${resp.status}`, debug: { sigDuration, resolveDuration } },
+        { status: 502 },
+      );
+    }
+
+    // Get CDN URL and m3u8 content
+    const cdnUrl = resp.url;
+    const m3u8Content = await resp.text();
+
+    if (!m3u8Content.includes("#EXTM3U")) {
+      return NextResponse.json(
+        { error: "Invalid m3u8", debug: { cdnUrl, bodyPreview: m3u8Content.substring(0, 200) } },
+        { status: 502 },
+      );
+    }
+
+    // Rewrite m3u8 with proxied segment URLs
+    const baseUrlObj = new URL(cdnUrl);
+    const pathParts = baseUrlObj.pathname.split("/");
+    pathParts.pop();
+    const basePath = pathParts.join("/") + "/";
+    const origin = request.nextUrl.origin;
+
+    const rewritten = m3u8Content
+      .split("\n")
+      .map((line) => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("#") || trimmed === "") return line;
+
+        let absoluteUrl: string;
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+          absoluteUrl = trimmed;
+        } else if (trimmed.startsWith("/")) {
+          absoluteUrl = `${baseUrlObj.origin}${trimmed}`;
+        } else {
+          absoluteUrl = `${baseUrlObj.origin}${basePath}${trimmed}`;
+        }
+
+        return `${origin}/api/stream?url=${encodeURIComponent(absoluteUrl)}`;
+      })
+      .join("\n");
+
+    // Return m3u8 directly (like direct-cdn)
+    return new NextResponse(rewritten, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-cache, no-store",
+        "X-CDN-URL": cdnUrl.substring(0, 100),
+        "X-Has-Signature": signature ? "yes" : "no",
+        "X-Sig-Duration": String(sigDuration),
+        "X-Resolve-Duration": String(resolveDuration),
+        "X-Total-Duration": String(Date.now() - totalStart),
+      },
     });
   } catch (error) {
     return NextResponse.json(

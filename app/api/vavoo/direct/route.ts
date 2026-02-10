@@ -3,185 +3,18 @@ import { NextRequest, NextResponse } from "next/server";
 export const runtime = "edge";
 
 /**
- * Step 1: Get addonSig from Vavoo ping API
- * Exactly as EasyProxy does in vavoo.py get_auth_signature()
+ * CDN Direct Proxy
+ * 
+ * Instead of proxying through vavoo.to (which adds a redirect hop),
+ * this endpoint resolves the real CDN URL upfront by following the
+ * vavoo.to redirect, then returns a proxy URL pointing directly
+ * at the CDN. This eliminates the 307 redirect hop on every manifest reload.
+ * 
+ * Flow:
+ * 1. Fetch vavoo.to/play/... with VAVOO/2.6 UA (follows redirect)
+ * 2. Get the final CDN URL (like https://xxx.ngolpdkyoctjcddxshli469r.org/...)
+ * 3. Return proxy URL pointing to CDN URL directly
  */
-async function getSignature(): Promise<{ sig: string | null; error: string | null; duration: number }> {
-  const start = Date.now();
-  const currentTime = Date.now();
-
-  const payload = {
-    token: "",
-    reason: "app-blur",
-    locale: "de",
-    theme: "dark",
-    metadata: {
-      device: {
-        type: "Handset",
-        brand: "google",
-        model: "Pixel",
-        name: "sdk_gphone64_arm64",
-        uniqueId: "d10e5d99ab665233",
-      },
-      os: {
-        name: "android",
-        version: "13",
-        abis: ["arm64-v8a", "armeabi-v7a", "armeabi"],
-        host: "android",
-      },
-      app: {
-        platform: "android",
-        version: "3.1.21",
-        buildId: "289515000",
-        engine: "hbc85",
-        signatures: [
-          "6e8a975e3cbf07d5de823a760d4c2547f86c1403105020adee5de67ac510999e",
-        ],
-        installer: "app.revanced.manager.flutter",
-      },
-      version: {
-        package: "tv.vavoo.app",
-        binary: "3.1.21",
-        js: "3.1.21",
-      },
-    },
-    appFocusTime: 0,
-    playerActive: false,
-    playDuration: 0,
-    devMode: false,
-    hasAddon: true,
-    castConnected: false,
-    package: "tv.vavoo.app",
-    version: "3.1.21",
-    process: "app",
-    firstAppStart: currentTime,
-    lastAppStart: currentTime,
-    ipLocation: "",
-    adblockEnabled: true,
-    proxy: {
-      supported: ["ss", "openvpn"],
-      engine: "ss",
-      ssVersion: 1,
-      enabled: true,
-      autoServer: true,
-      id: "de-fra",
-    },
-    iap: { supported: false },
-  };
-
-  try {
-    const resp = await fetch("https://www.vavoo.tv/api/app/ping", {
-      method: "POST",
-      headers: {
-        "User-Agent": "okhttp/4.11.0",
-        Accept: "application/json",
-        "Content-Type": "application/json; charset=utf-8",
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      return {
-        sig: null,
-        error: `Ping failed: ${resp.status} ${text.substring(0, 100)}`,
-        duration: Date.now() - start,
-      };
-    }
-
-    const data = await resp.json();
-    const sig = data?.addonSig || null;
-    return {
-      sig,
-      error: sig ? null : `No addonSig in response: ${JSON.stringify(data).substring(0, 200)}`,
-      duration: Date.now() - start,
-    };
-  } catch (e) {
-    return {
-      sig: null,
-      error: `Ping exception: ${e instanceof Error ? e.message : String(e)}`,
-      duration: Date.now() - start,
-    };
-  }
-}
-
-/**
- * Step 2: Resolve vavoo URL to real CDN URL
- * Exactly as EasyProxy does in vavoo.py _resolve_vavoo_link()
- */
-async function resolveUrl(
-  url: string,
-  signature: string,
-): Promise<{ resolvedUrl: string | null; error: string | null; duration: number; rawResponse: string }> {
-  const start = Date.now();
-  const payload = {
-    language: "de",
-    region: "AT",
-    url: url,
-    clientVersion: "3.1.21",
-  };
-
-  try {
-    const resp = await fetch("https://vavoo.to/mediahubmx-resolve.json", {
-      method: "POST",
-      headers: {
-        "User-Agent": "MediaHubMX/2",
-        Accept: "application/json",
-        "Content-Type": "application/json; charset=utf-8",
-        "mediahubmx-signature": signature,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      return {
-        resolvedUrl: null,
-        error: `Resolve failed: ${resp.status} ${text.substring(0, 200)}`,
-        duration: Date.now() - start,
-        rawResponse: text.substring(0, 500),
-      };
-    }
-
-    const result = await resp.json();
-    const raw = JSON.stringify(result).substring(0, 500);
-
-    // Handle array response (most common from EasyProxy)
-    if (Array.isArray(result) && result.length > 0 && result[0]?.url) {
-      return {
-        resolvedUrl: result[0].url,
-        error: null,
-        duration: Date.now() - start,
-        rawResponse: raw,
-      };
-    }
-
-    // Handle object response
-    if (result && typeof result === "object" && result.url) {
-      return {
-        resolvedUrl: result.url,
-        error: null,
-        duration: Date.now() - start,
-        rawResponse: raw,
-      };
-    }
-
-    return {
-      resolvedUrl: null,
-      error: `No URL in resolve response`,
-      duration: Date.now() - start,
-      rawResponse: raw,
-    };
-  } catch (e) {
-    return {
-      resolvedUrl: null,
-      error: `Resolve exception: ${e instanceof Error ? e.message : String(e)}`,
-      duration: Date.now() - start,
-      rawResponse: "",
-    };
-  }
-}
-
 export async function POST(request: NextRequest) {
   const totalStart = Date.now();
 
@@ -193,67 +26,92 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "URL is required" }, { status: 400 });
     }
 
-    // Step 1: Get signature
-    const sigResult = await getSignature();
-    if (!sigResult.sig) {
+    // Step 1: Resolve the vavoo.to URL to the real CDN URL by following redirects
+    const resolveStart = Date.now();
+    
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": "VAVOO/2.6",
+        "Accept": "*/*",
+      },
+      redirect: "follow",
+    });
+
+    const resolveDuration = Date.now() - resolveStart;
+
+    if (!resp.ok) {
       return NextResponse.json(
         {
-          error: "Signature failed",
-          debug: {
-            step: "signature",
-            detail: sigResult.error,
-            duration: sigResult.duration,
-          },
+          error: `CDN resolve failed: ${resp.status}`,
+          debug: { resolveDuration, status: resp.status },
         },
         { status: 502 },
       );
     }
 
-    // Step 2: Resolve URL
-    const resolveResult = await resolveUrl(url, sigResult.sig);
-    if (!resolveResult.resolvedUrl) {
+    // The response.url is the final CDN URL after redirects
+    const cdnUrl = resp.url;
+    
+    // Read the m3u8 content to verify it's valid
+    const m3u8Content = await resp.text();
+    const isValid = m3u8Content.includes("#EXTM3U");
+
+    if (!isValid) {
       return NextResponse.json(
         {
-          error: "Resolve failed",
-          debug: {
-            step: "resolve",
-            detail: resolveResult.error,
-            signatureDuration: sigResult.duration,
-            resolveDuration: resolveResult.duration,
-            rawResponse: resolveResult.rawResponse,
-          },
+          error: "Invalid m3u8 response from CDN",
+          debug: { cdnUrl, resolveDuration, bodyPreview: m3u8Content.substring(0, 200) },
         },
         { status: 502 },
       );
     }
 
-    // Step 3: Build proxy URL with correct headers for the resolved CDN
-    // EasyProxy uses: user-agent: Mozilla/..., referer: https://vavoo.to/
-    const baseUrl = request.nextUrl.origin;
-    const params = new URLSearchParams();
-    params.set("url", encodeURIComponent(resolveResult.resolvedUrl));
-    params.set(
-      "ua",
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    );
-    params.set("referer", "https://vavoo.to/");
-    const proxyUrl = `${baseUrl}/api/stream?${params.toString()}`;
+    // Step 2: Rewrite the m3u8 inline (segments are relative, make them absolute via proxy)
+    const baseUrlObj = new URL(cdnUrl);
+    const pathParts = baseUrlObj.pathname.split("/");
+    pathParts.pop();
+    const basePath = pathParts.join("/") + "/";
+    const origin = request.nextUrl.origin;
 
-    return NextResponse.json({
-      proxyUrl,
-      debug: {
-        resolvedUrl: resolveResult.resolvedUrl,
-        signatureDuration: sigResult.duration,
-        resolveDuration: resolveResult.duration,
-        totalDuration: Date.now() - totalStart,
-        rawResponse: resolveResult.rawResponse,
+    const rewritten = m3u8Content
+      .split("\n")
+      .map((line) => {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("#") || trimmed === "") return line;
+
+        // Build absolute CDN URL for this segment
+        let absoluteUrl: string;
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+          absoluteUrl = trimmed;
+        } else if (trimmed.startsWith("/")) {
+          absoluteUrl = `${baseUrlObj.origin}${trimmed}`;
+        } else {
+          absoluteUrl = `${baseUrlObj.origin}${basePath}${trimmed}`;
+        }
+
+        // Proxy through /api/stream (CDN segments don't need special UA)
+        return `${origin}/api/stream?url=${encodeURIComponent(absoluteUrl)}`;
+      })
+      .join("\n");
+
+    // Return as m3u8 directly so HLS.js can consume it
+    return new NextResponse(rewritten, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-cache, no-store",
+        "X-CDN-URL": cdnUrl.substring(0, 100),
+        "X-Resolve-Duration": String(resolveDuration),
+        "X-Total-Duration": String(Date.now() - totalStart),
       },
     });
   } catch (error) {
     return NextResponse.json(
       {
         error: error instanceof Error ? error.message : "Unknown error",
-        debug: { step: "outer", totalDuration: Date.now() - totalStart },
+        debug: { totalDuration: Date.now() - totalStart },
       },
       { status: 500 },
     );

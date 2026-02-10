@@ -41,52 +41,22 @@ export async function GET(request: NextRequest) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
 
+    // Use redirect: "follow" to avoid double-hop latency
     const response = await fetch(targetUrl, {
       headers,
-      redirect: "manual",
+      redirect: "follow",
       signal: controller.signal,
     }).finally(() => clearTimeout(timeoutId));
 
-    // Handle redirects - follow through proxy
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-      if (location) {
-        let redirectUrl: string;
-        if (
-          location.startsWith("http://") ||
-          location.startsWith("https://")
-        ) {
-          redirectUrl = location;
-        } else if (location.startsWith("/")) {
-          const base = new URL(targetUrl);
-          redirectUrl = `${base.origin}${location}`;
-        } else {
-          const base = new URL(targetUrl);
-          const basePath = base.pathname.substring(
-            0,
-            base.pathname.lastIndexOf("/") + 1,
-          );
-          redirectUrl = `${base.origin}${basePath}${location}`;
-        }
-
-        const params = new URLSearchParams();
-        params.set("url", encodeURIComponent(redirectUrl));
-        if (ua !== "VAVOO/2.6") params.set("ua", ua);
-        if (referer) params.set("referer", referer);
-
-        return NextResponse.redirect(
-          `${request.nextUrl.origin}/api/stream?${params.toString()}`,
-          307,
-        );
-      }
-    }
-
-    if (!response.ok) {
+    if (!response.ok && response.status !== 206) {
       return NextResponse.json(
         { error: `Stream error: ${response.status}` },
         { status: response.status },
       );
     }
+
+    // Get the final URL after redirects (for correct base URL in m3u8 rewriting)
+    const finalUrl = response.url || targetUrl;
 
     const contentType = response.headers.get("content-type") || "";
 
@@ -94,10 +64,12 @@ export async function GET(request: NextRequest) {
     if (
       contentType.includes("mpegurl") ||
       contentType.includes("m3u8") ||
-      targetUrl.includes(".m3u8")
+      targetUrl.includes(".m3u8") ||
+      finalUrl.includes(".m3u8")
     ) {
       const text = await response.text();
-      const baseUrl = new URL(targetUrl);
+      // Use finalUrl (after redirects) for correct CDN base path
+      const baseUrl = new URL(finalUrl);
       const pathParts = baseUrl.pathname.split("/");
       pathParts.pop();
       const basePath = pathParts.join("/") + "/";
@@ -119,10 +91,9 @@ export async function GET(request: NextRequest) {
           absoluteUrl = `${baseUrl.origin}${basePath}${trimmed}`;
         }
 
+        // Segments from CDN don't need special UA
         const params = new URLSearchParams();
         params.set("url", encodeURIComponent(absoluteUrl));
-        if (ua !== "VAVOO/2.6") params.set("ua", ua);
-        if (referer) params.set("referer", referer);
 
         return `${request.nextUrl.origin}/api/stream?${params.toString()}`;
       });

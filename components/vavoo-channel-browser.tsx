@@ -143,37 +143,50 @@ export default function VavooChannelBrowser() {
       const fetchStart = Date.now();
 
       if (proxyMode === "direct-cdn") {
-        addLog("info", "Calling /api/vavoo/direct (signature + resolve)...");
+        addLog("info", "Calling /api/vavoo/direct (resolve CDN URL upfront)...");
         const response = await fetch("/api/vavoo/direct", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: channel.url }),
         });
 
-        const data = await response.json();
         if (!response.ok) {
+          const data = await response.json().catch(() => ({ error: "Unknown" }));
           addLog("error", `Direct CDN failed: ${data.error}`, data.debug);
           throw new Error(data.error || "Direct CDN failed");
         }
 
-        proxyUrl = data.proxyUrl;
-        addLog("success", `Resolved in ${Date.now() - fetchStart}ms`, data.debug);
+        // The endpoint returns m3u8 content directly - create a blob URL
+        const m3u8Text = await response.text();
+        const blob = new Blob([m3u8Text], { type: "application/vnd.apple.mpegurl" });
+        proxyUrl = URL.createObjectURL(blob);
+        
+        const cdnUrl = response.headers.get("X-CDN-URL") || "unknown";
+        const resolveDuration = response.headers.get("X-Resolve-Duration") || "?";
+        addLog("success", `CDN resolved in ${resolveDuration}ms | CDN: ${cdnUrl}`);
       } else if (proxyMode === "auth") {
-        addLog("info", "Calling /api/vavoo/auth-stream (with signature)...");
+        addLog("info", "Calling /api/vavoo/auth-stream (MediaHubMX UA + signature)...");
         const response = await fetch("/api/vavoo/auth-stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: channel.url }),
         });
 
-        const data = await response.json();
         if (!response.ok) {
-          addLog("error", `Auth proxy failed: ${data.error}`, data);
+          const data = await response.json().catch(() => ({ error: "Unknown" }));
+          addLog("error", `Auth proxy failed: ${data.error}`, data.debug);
           throw new Error(data.error || "Auth proxy failed");
         }
 
-        proxyUrl = data.proxyUrl;
-        addLog("success", `Auth proxy ready in ${Date.now() - fetchStart}ms | Signature: ${data.hasSignature ? "yes" : "no"}`);
+        // Returns m3u8 directly - create blob URL
+        const m3u8Text = await response.text();
+        const blob = new Blob([m3u8Text], { type: "application/vnd.apple.mpegurl" });
+        proxyUrl = URL.createObjectURL(blob);
+        
+        const hasSig = response.headers.get("X-Has-Signature") || "?";
+        const sigDuration = response.headers.get("X-Sig-Duration") || "?";
+        const resolveDuration = response.headers.get("X-Resolve-Duration") || "?";
+        addLog("success", `Auth proxy ready: sig=${hasSig} (${sigDuration}ms) resolve=${resolveDuration}ms`);
       } else {
         addLog("info", "Calling /api/proxy (standard)...");
         const response = await fetch("/api/proxy", {
@@ -199,19 +212,32 @@ export default function VavooChannelBrowser() {
             debug: false,
             enableWorker: true,
             lowLatencyMode: false,
-            backBufferLength: 90,
-            maxBufferLength: 30,
-            maxMaxBufferLength: 60,
-            maxBufferSize: 60 * 1000 * 1000,
-            maxBufferHole: 0.5,
-            manifestLoadingTimeOut: 15000,
-            manifestLoadingMaxRetry: 4,
-            levelLoadingTimeOut: 15000,
-            levelLoadingMaxRetry: 4,
-            fragLoadingTimeOut: 25000,
-            fragLoadingMaxRetry: 6,
+            // Aggressive buffering to prevent stalls
+            backBufferLength: 30,
+            maxBufferLength: 60,
+            maxMaxBufferLength: 120,
+            maxBufferSize: 120 * 1000 * 1000,
+            maxBufferHole: 1.5,
+            // Tolerant of slow loads
+            manifestLoadingTimeOut: 20000,
+            manifestLoadingMaxRetry: 6,
+            levelLoadingTimeOut: 20000,
+            levelLoadingMaxRetry: 6,
+            fragLoadingTimeOut: 30000,
+            fragLoadingMaxRetry: 8,
+            // Performance
             startFragPrefetch: true,
             progressive: true,
+            // Start at lowest quality then upgrade (faster first frame)
+            startLevel: 0,
+            // ABR tuning
+            abrEwmaDefaultEstimate: 1000000,
+            abrBandWidthFactor: 0.8,
+            abrBandWidthUpFactor: 0.5,
+            // Nudge past stalls
+            nudgeOffset: 0.2,
+            nudgeMaxRetry: 10,
+            highBufferWatchdogPeriod: 3,
           });
 
           hlsRef.current = hls;
