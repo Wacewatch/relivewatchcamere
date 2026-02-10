@@ -1,11 +1,11 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Globe, Tv, Loader2, AlertCircle, Play, Search, ArrowLeft, Signal } from 'lucide-react'
 import { Input } from '@/components/ui/input'
-import { Globe, Tv, Loader2, AlertCircle, Play, Search, ArrowLeft, CheckCircle2 } from 'lucide-react'
 import Hls from 'hls.js'
 
 interface Channel {
@@ -30,16 +30,20 @@ export default function VavooChannelBrowser() {
   const [error, setError] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [playError, setPlayError] = useState<string | null>(null)
-  const [playing, setPlaying] = useState(false)
+  const [bufferHealth, setBufferHealth] = useState<number>(0)
   
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
+  const bufferCheckInterval = useRef<NodeJS.Timeout | null>(null)
 
   useEffect(() => {
     loadCountries()
     return () => {
       if (hlsRef.current) {
         hlsRef.current.destroy()
+      }
+      if (bufferCheckInterval.current) {
+        clearInterval(bufferCheckInterval.current)
       }
     }
   }, [])
@@ -62,59 +66,14 @@ export default function VavooChannelBrowser() {
     }
   }
 
-  const playChannel = async (channel: Channel, proxyMode: 'standard' | 'auth-simple' | 'direct-cdn' = 'standard') => {
+  const playChannel = async (channel: Channel) => {
     setSelectedChannel(channel)
     setPlayError(null)
-    setPlaying(true)
+    setBufferHealth(0)
 
     try {
-      let proxyUrl: string
-
-      if (proxyMode === 'direct-cdn') {
-        // Use direct CDN resolver (resolves to real CDN URL)
-        const response = await fetch('/api/vavoo/direct', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: channel.url })
-        })
-
-        if (!response.ok) {
-          const errData = await response.json().catch(() => ({}))
-          throw new Error(errData.error || 'Failed to resolve direct CDN URL')
-        }
-
-        const data = await response.json()
-        proxyUrl = data.proxyUrl
-      } else if (proxyMode === 'auth-simple') {
-        // Use auth-stream proxy (adds signature to standard proxy)
-        const response = await fetch('/api/vavoo/auth-stream', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: channel.url })
-        })
-
-        if (!response.ok) {
-          const errData = await response.json().catch(() => ({}))
-          throw new Error(errData.error || 'Failed to get authenticated proxy')
-        }
-
-        const data = await response.json()
-        proxyUrl = data.proxyUrl
-      } else {
-        // Use standard proxy method (simple /api/proxy)
-        const response = await fetch('/api/proxy', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: channel.url })
-        })
-
-        if (!response.ok) {
-          throw new Error('Failed to get proxy URL')
-        }
-
-        const data = await response.json()
-        proxyUrl = data.proxyUrl
-      }
+      const encodedUrl = encodeURIComponent(channel.url)
+      const proxyUrl = `/api/vavoo-stream?url=${encodedUrl}`
 
       if (videoRef.current) {
         if (Hls.isSupported()) {
@@ -125,46 +84,89 @@ export default function VavooChannelBrowser() {
           const hls = new Hls({
             debug: false,
             enableWorker: true,
-            lowLatencyMode: false,
-            backBufferLength: 90,
+            
+            // Buffer optimisé
             maxBufferLength: 30,
-            maxMaxBufferLength: 60,
+            maxMaxBufferLength: 90,
             maxBufferSize: 60 * 1000 * 1000,
             maxBufferHole: 0.5,
-            manifestLoadingTimeOut: 15000,
+            
+            // Loading optimisé
+            manifestLoadingTimeOut: 20000,
             manifestLoadingMaxRetry: 4,
-            levelLoadingTimeOut: 15000,
+            manifestLoadingRetryDelay: 1000,
+            
+            levelLoadingTimeOut: 20000,
             levelLoadingMaxRetry: 4,
-            fragLoadingTimeOut: 25000,
+            levelLoadingRetryDelay: 1000,
+            
+            fragLoadingTimeOut: 30000,
             fragLoadingMaxRetry: 6,
-            startFragPrefetch: true,
+            fragLoadingRetryDelay: 1000,
+            
+            // Progressive loading
             progressive: true,
+            
+            // Auto quality
+            startLevel: -1,
+            capLevelToPlayerSize: true,
+            
+            // ABR
+            abrEwmaDefaultEstimate: 500000,
+            abrBandWidthFactor: 0.95,
+            abrBandWidthUpFactor: 0.7,
+            
+            // Fragmentation
+            backBufferLength: 90,
+            
             xhrSetup: (xhr) => {
-              xhr.setRequestHeader('User-Agent', 'VAVOO/2.6')
-            }
+              xhr.timeout = 30000
+            },
           })
 
           hlsRef.current = hls
 
+          // Event: Manifest loaded
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            videoRef.current?.play().catch(() => {
-              setPlayError('Cliquez sur play pour lancer la lecture')
+            console.log('[HLS] Manifest parsed, starting playback')
+            videoRef.current?.play().catch((err) => {
+              console.error('[HLS] Play error:', err)
+              setPlayError('Cliquez sur play pour démarrer')
             })
           })
 
-          hls.on(Hls.Events.ERROR, (_event, data) => {
+          // Event: Level loaded
+          hls.on(Hls.Events.LEVEL_LOADED, (event, data) => {
+            console.log(`[HLS] Level ${data.level} loaded with ${data.details.fragments.length} fragments`)
+          })
+
+          // Event: Fragment loaded
+          hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+            console.log(`[HLS] Fragment loaded: ${data.frag.sn}, duration: ${data.frag.duration.toFixed(2)}s`)
+          })
+
+          // Event: Errors
+          hls.on(Hls.Events.ERROR, (event, data) => {
+            console.error('[HLS] Error:', data.type, data.details, data.fatal)
+
             if (data.fatal) {
               switch (data.type) {
                 case Hls.ErrorTypes.NETWORK_ERROR:
+                  console.log('[HLS] Network error, attempting recovery...')
                   setPlayError('Erreur réseau - reconnexion...')
                   setTimeout(() => {
                     hls.startLoad()
                     setPlayError(null)
-                  }, 2000)
+                  }, 1000)
                   break
+
                 case Hls.ErrorTypes.MEDIA_ERROR:
+                  console.log('[HLS] Media error, attempting recovery...')
+                  setPlayError('Erreur média - récupération...')
                   hls.recoverMediaError()
+                  setTimeout(() => setPlayError(null), 2000)
                   break
+
                 default:
                   setPlayError(`Erreur: ${data.details}`)
                   break
@@ -172,10 +174,28 @@ export default function VavooChannelBrowser() {
             }
           })
 
+          // Buffer monitoring
+          if (bufferCheckInterval.current) {
+            clearInterval(bufferCheckInterval.current)
+          }
+
+          bufferCheckInterval.current = setInterval(() => {
+            if (videoRef.current) {
+              const buffered = videoRef.current.buffered
+              if (buffered.length > 0) {
+                const bufferEnd = buffered.end(buffered.length - 1)
+                const currentTime = videoRef.current.currentTime
+                const bufferAhead = bufferEnd - currentTime
+                setBufferHealth(Math.min(100, (bufferAhead / 10) * 100))
+              }
+            }
+          }, 500)
+
           hls.loadSource(proxyUrl)
           hls.attachMedia(videoRef.current)
 
         } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
+          // Native HLS support (Safari)
           videoRef.current.src = proxyUrl
           videoRef.current.play().catch(() => {
             setPlayError('Erreur de lecture')
@@ -243,12 +263,12 @@ export default function VavooChannelBrowser() {
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
       <div className="container mx-auto px-4 py-8">
         <div className="max-w-7xl mx-auto space-y-6">
-          {/* Video Player - Show when channel selected */}
+          {/* Video Player */}
           {selectedChannel && (
             <Card className="bg-slate-900/50 border-slate-800 backdrop-blur">
               <CardHeader>
                 <div className="flex items-center justify-between">
-                  <div className="space-y-1">
+                  <div className="space-y-1 flex-1">
                     <CardTitle className="text-white flex items-center gap-2">
                       <Play className="w-5 h-5 text-blue-400" />
                       {selectedChannel.name}
@@ -257,20 +277,33 @@ export default function VavooChannelBrowser() {
                       {selectedCountry?.name}
                     </CardDescription>
                   </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      setSelectedChannel(null)
-                      if (hlsRef.current) {
-                        hlsRef.current.destroy()
-                      }
-                    }}
-                    className="bg-slate-800 border-slate-700 text-white hover:bg-slate-700"
-                  >
-                    <ArrowLeft className="w-4 h-4 mr-2" />
-                    Retour
-                  </Button>
+                  
+                  {/* Buffer Health Indicator */}
+                  <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-2">
+                      <Signal className={`w-4 h-4 ${bufferHealth > 50 ? 'text-green-400' : bufferHealth > 20 ? 'text-yellow-400' : 'text-red-400'}`} />
+                      <span className="text-sm text-slate-400">
+                        Buffer: {bufferHealth.toFixed(0)}%
+                      </span>
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setSelectedChannel(null)
+                        if (hlsRef.current) {
+                          hlsRef.current.destroy()
+                        }
+                        if (bufferCheckInterval.current) {
+                          clearInterval(bufferCheckInterval.current)
+                        }
+                      }}
+                      className="bg-slate-800 border-slate-700 text-white hover:bg-slate-700"
+                    >
+                      <ArrowLeft className="w-4 h-4 mr-2" />
+                      Retour
+                    </Button>
+                  </div>
                 </div>
               </CardHeader>
               <CardContent className="space-y-4">
@@ -280,36 +313,6 @@ export default function VavooChannelBrowser() {
                     <AlertDescription>{playError}</AlertDescription>
                   </Alert>
                 )}
-                
-                <div className="flex gap-2 flex-wrap">
-                  <Button
-                    onClick={() => selectedChannel && playChannel(selectedChannel, 'standard')}
-                    variant="outline"
-                    size="sm"
-                    className="bg-slate-800 border-slate-700 hover:bg-slate-700"
-                  >
-                    <Play className="w-4 h-4 mr-2" />
-                    Proxy Standard
-                  </Button>
-                  <Button
-                    onClick={() => selectedChannel && playChannel(selectedChannel, 'auth-simple')}
-                    variant="outline"
-                    size="sm"
-                    className="bg-blue-900/50 border-blue-700 hover:bg-blue-800 text-blue-200"
-                  >
-                    <CheckCircle2 className="w-4 h-4 mr-2" />
-                    Proxy avec Auth
-                  </Button>
-                  <Button
-                    onClick={() => selectedChannel && playChannel(selectedChannel, 'direct-cdn')}
-                    variant="outline"
-                    size="sm"
-                    className="bg-green-900/50 border-green-700 hover:bg-green-800 text-green-200"
-                  >
-                    <CheckCircle2 className="w-4 h-4 mr-2" />
-                    CDN Direct (Rapide)
-                  </Button>
-                </div>
 
                 <div className="relative aspect-video bg-black rounded-lg overflow-hidden">
                   <video
@@ -350,7 +353,7 @@ export default function VavooChannelBrowser() {
                     >
                       <div className="flex flex-col items-center gap-2 w-full">
                         <img
-                          src={getCountryFlagUrl(country.code) || "/placeholder.svg"}
+                          src={getCountryFlagUrl(country.code)}
                           alt={country.name}
                           className="w-10 h-7 object-cover rounded shadow-sm"
                           crossOrigin="anonymous"
@@ -426,7 +429,7 @@ export default function VavooChannelBrowser() {
                         <div className="w-10 h-10 rounded-lg bg-slate-700 flex items-center justify-center flex-shrink-0">
                           {channel.logo ? (
                             <img
-                              src={channel.logo || "/placeholder.svg"}
+                              src={channel.logo}
                               alt={channel.name}
                               className="w-8 h-8 object-contain"
                             />
