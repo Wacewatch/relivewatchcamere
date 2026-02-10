@@ -3,50 +3,37 @@ import { NextRequest, NextResponse } from 'next/server'
 export const runtime = 'edge'
 export const dynamic = 'force-dynamic'
 
-// Cache global pour les signatures et résolutions
-const cache = {
-  signature: null as { sig: string; exp: number } | null,
-  cdnUrls: new Map<string, { url: string; exp: number }>(),
-}
+// Cache pour stocker les signatures Vavoo
+let cachedSignature: { sig: string; timestamp: number } | null = null
+const SIGNATURE_CACHE_DURATION = 3600000 // 1 heure
 
-// Nettoyer le cache expiré
-function cleanExpiredCache() {
-  const now = Date.now()
-  if (cache.signature && cache.signature.exp < now) {
-    cache.signature = null
-  }
-  for (const [key, value] of cache.cdnUrls.entries()) {
-    if (value.exp < now) {
-      cache.cdnUrls.delete(key)
-    }
-  }
-}
+// Cache pour CDN resolved URLs
+const cdnCache = new Map<string, { url: string; exp: number }>()
 
-// Obtenir la signature Vavoo
 async function getVavooSignature(): Promise<string | null> {
-  cleanExpiredCache()
-  
-  if (cache.signature && cache.signature.exp > Date.now()) {
-    return cache.signature.sig
+  // Verifier le cache
+  if (cachedSignature && Date.now() - cachedSignature.timestamp < SIGNATURE_CACHE_DURATION) {
+    return cachedSignature.sig
   }
 
+  const currentTime = Date.now()
   const payload = {
     token: '',
-    reason: 'app-start',
-    locale: 'en',
+    reason: 'app-blur',
+    locale: 'de',
     theme: 'dark',
     metadata: {
       device: {
         type: 'Handset',
         brand: 'google',
-        model: 'Pixel 7',
-        name: 'google_pixel_7',
-        uniqueId: crypto.randomUUID().replace(/-/g, '').substring(0, 16),
+        model: 'Pixel',
+        name: 'sdk_gphone64_arm64',
+        uniqueId: 'd10e5d99ab665233',
       },
       os: {
         name: 'android',
-        version: '14',
-        abis: ['arm64-v8a'],
+        version: '13',
+        abis: ['arm64-v8a', 'armeabi-v7a', 'armeabi'],
         host: 'android',
       },
       app: {
@@ -55,7 +42,7 @@ async function getVavooSignature(): Promise<string | null> {
         buildId: '289515000',
         engine: 'hbc85',
         signatures: ['6e8a975e3cbf07d5de823a760d4c2547f86c1403105020adee5de67ac510999e'],
-        installer: 'com.android.vending',
+        installer: 'app.revanced.manager.flutter',
       },
       version: {
         package: 'tv.vavoo.app',
@@ -72,10 +59,10 @@ async function getVavooSignature(): Promise<string | null> {
     package: 'tv.vavoo.app',
     version: '3.1.21',
     process: 'app',
-    firstAppStart: Date.now(),
-    lastAppStart: Date.now(),
+    firstAppStart: currentTime,
+    lastAppStart: currentTime,
     ipLocation: '',
-    adblockEnabled: false,
+    adblockEnabled: true,
     proxy: {
       supported: ['ss', 'openvpn'],
       engine: 'ss',
@@ -94,42 +81,44 @@ async function getVavooSignature(): Promise<string | null> {
         'User-Agent': 'okhttp/4.11.0',
         'Accept': 'application/json',
         'Content-Type': 'application/json; charset=utf-8',
+        'Accept-Encoding': 'gzip',
       },
       body: JSON.stringify(payload),
     })
 
-    if (!response.ok) return null
-
-    const data = await response.json()
-    const sig = data?.addonSig
-
-    if (sig) {
-      cache.signature = {
-        sig,
-        exp: Date.now() + 3600000, // 1h
-      }
-      console.log('[Auth] Signature obtained')
+    if (!response.ok) {
+      console.error('[Vavoo Auth] Ping failed:', response.status)
+      return null
     }
 
-    return sig
+    const data = await response.json()
+    const signature = data?.addonSig || null
+
+    if (signature) {
+      cachedSignature = { sig: signature, timestamp: Date.now() }
+      console.log('[Vavoo Auth] Signature obtained and cached')
+    } else {
+      console.error('[Vavoo Auth] No addonSig in response')
+    }
+
+    return signature
   } catch (error) {
-    console.error('[Auth] Error:', error)
+    console.error('[Vavoo Auth] Error:', error)
     return null
   }
 }
 
-// Résoudre l'URL Vavoo vers CDN direct
+// Resolve vavoo.to URL to CDN direct URL
 async function resolveVavooUrl(vavooUrl: string, signature: string): Promise<string | null> {
-  cleanExpiredCache()
-  
-  const cached = cache.cdnUrls.get(vavooUrl)
+  // Check cache
+  const cached = cdnCache.get(vavooUrl)
   if (cached && cached.exp > Date.now()) {
     return cached.url
   }
 
   const payload = {
-    language: 'en',
-    region: 'US',
+    language: 'de',
+    region: 'AT',
     url: vavooUrl,
     clientVersion: '3.1.21',
   }
@@ -141,13 +130,14 @@ async function resolveVavooUrl(vavooUrl: string, signature: string): Promise<str
         'User-Agent': 'MediaHubMX/2',
         'Accept': 'application/json',
         'Content-Type': 'application/json; charset=utf-8',
+        'Accept-Encoding': 'gzip',
         'mediahubmx-signature': signature,
       },
       body: JSON.stringify(payload),
     })
 
     if (!response.ok) {
-      console.error('[CDN] Resolve failed:', response.status)
+      console.error('[CDN Resolve] Failed:', response.status)
       return null
     }
 
@@ -161,16 +151,13 @@ async function resolveVavooUrl(vavooUrl: string, signature: string): Promise<str
     }
 
     if (cdnUrl) {
-      cache.cdnUrls.set(vavooUrl, {
-        url: cdnUrl,
-        exp: Date.now() + 1800000, // 30min
-      })
-      console.log('[CDN] Resolved:', cdnUrl.substring(0, 50) + '...')
+      cdnCache.set(vavooUrl, { url: cdnUrl, exp: Date.now() + 1800000 })
+      console.log('[CDN Resolve] OK:', cdnUrl.substring(0, 80))
     }
 
     return cdnUrl
   } catch (error) {
-    console.error('[CDN] Resolve error:', error)
+    console.error('[CDN Resolve] Error:', error)
     return null
   }
 }
@@ -193,46 +180,60 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid URL' }, { status: 400 })
     }
 
+    // Always get signature - needed for ALL vavoo.to requests
+    const signature = await getVavooSignature()
+
     let finalUrl = targetUrl
-    const headers: HeadersInit = {
-      'User-Agent': 'VAVOO/2.6',
+    let useVavooHeaders = true
+
+    // Check if this is a vavoo.to URL
+    const isVavoo = (() => {
+      try {
+        return new URL(targetUrl).hostname.includes('vavoo.to')
+      } catch {
+        return false
+      }
+    })()
+
+    // Mode CDN: try to resolve vavoo.to URLs to direct CDN
+    if (mode === 'cdn' && isVavoo && signature) {
+      const cdnUrl = await resolveVavooUrl(targetUrl, signature)
+      if (cdnUrl) {
+        finalUrl = cdnUrl
+        useVavooHeaders = false // CDN URLs don't need vavoo headers
+      } else {
+        // CDN resolve failed - fall back to direct proxy with signature
+        console.log('[CDN] Resolve failed, falling back to direct proxy with auth')
+      }
+    }
+
+    // For non-vavoo URLs (CDN segments), don't use vavoo headers
+    if (!isVavoo) {
+      useVavooHeaders = false
+    }
+
+    // Build headers
+    const headers: Record<string, string> = {
+      'User-Agent': useVavooHeaders ? 'VAVOO/2.6' : 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
       'Accept': '*/*',
       'Connection': 'keep-alive',
+      'Accept-Encoding': 'gzip, deflate',
     }
 
-    // Mode CDN Direct - Résolution complète vers CDN
-    if (mode === 'cdn' && targetUrl.includes('vavoo.to')) {
-      const signature = await getVavooSignature()
-      if (!signature) {
-        return NextResponse.json({ error: 'Auth failed' }, { status: 502 })
-      }
-
-      const cdnUrl = await resolveVavooUrl(targetUrl, signature)
-      if (!cdnUrl) {
-        return NextResponse.json({ error: 'CDN resolve failed' }, { status: 502 })
-      }
-
-      finalUrl = cdnUrl
-      // Pour CDN, pas besoin de signature
-      delete headers['mediahubmx-signature']
-    }
-    // Mode avec Auth - Ajouter signature
-    else if (mode === 'auth') {
-      const signature = await getVavooSignature()
-      if (signature) {
-        headers['mediahubmx-signature'] = signature
-      }
+    // ALWAYS add signature for vavoo.to URLs (this is the key fix!)
+    if (isVavoo && signature && useVavooHeaders) {
+      headers['mediahubmx-signature'] = signature
     }
 
-    // Range support
+    // Range support for seeking
     const rangeHeader = request.headers.get('range')
     if (rangeHeader) {
       headers['Range'] = rangeHeader
     }
 
-    // Fetch avec timeout optimisé
+    // Fetch with timeout
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 20000)
+    const timeoutId = setTimeout(() => controller.abort(), 30000)
 
     const response = await fetch(finalUrl, {
       headers,
@@ -240,23 +241,26 @@ export async function GET(request: NextRequest) {
       signal: controller.signal,
     }).finally(() => clearTimeout(timeoutId))
 
+    // Handle errors
     if (!response.ok && response.status !== 206) {
-      console.error('[Fetch] Error:', response.status, finalUrl)
+      console.error(`[Stream] Error ${response.status} for: ${finalUrl.substring(0, 100)}`)
       return NextResponse.json(
-        { error: `Fetch error: ${response.status}` },
+        { error: `Stream error: ${response.status}` },
         { status: response.status }
       )
     }
 
     const contentType = response.headers.get('content-type') || ''
 
-    // Traitement M3U8
+    // M3U8 manifest processing - rewrite URLs to proxy through us
     if (
       contentType.includes('mpegurl') ||
       contentType.includes('m3u8') ||
+      finalUrl.includes('.m3u8') ||
       targetUrl.includes('.m3u8')
     ) {
       const text = await response.text()
+
       const baseUrl = new URL(finalUrl)
       const pathParts = baseUrl.pathname.split('/')
       pathParts.pop()
@@ -280,9 +284,8 @@ export async function GET(request: NextRequest) {
         }
 
         const encodedUrl = encodeURIComponent(absoluteUrl)
-        // Propager le mode CDN pour les segments
-        const segmentMode = mode === 'cdn' ? '&mode=cdn' : mode === 'auth' ? '&mode=auth' : ''
-        return `${request.nextUrl.origin}/api/vavoo-stream-v2?url=${encodedUrl}${segmentMode}`
+        // Keep the same mode for sub-requests (segments, sub-playlists)
+        return `${request.nextUrl.origin}/api/vavoo-stream-v2?url=${encodedUrl}&mode=${mode}`
       })
 
       return new NextResponse(rewrittenLines.join('\n'), {
@@ -292,33 +295,38 @@ export async function GET(request: NextRequest) {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, OPTIONS',
           'Access-Control-Allow-Headers': 'Range, User-Agent, Content-Type',
-          'Cache-Control': 'no-cache',
+          'Cache-Control': 'public, max-age=10',
         },
       })
     }
 
-    // Streaming segments avec cache agressif
-    const responseHeaders: HeadersInit = {
+    // Streaming segments
+    const responseHeaders: Record<string, string> = {
       'Content-Type': contentType || 'video/MP2T',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
       'Access-Control-Allow-Headers': 'Range, User-Agent, Content-Type',
       'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
       'Accept-Ranges': 'bytes',
-      'Cache-Control': 'public, max-age=31536000, immutable', // Cache 1 an
+      'Cache-Control': 'public, max-age=86400',
     }
 
     const contentLength = response.headers.get('content-length')
     const contentRange = response.headers.get('content-range')
+    const acceptRanges = response.headers.get('accept-ranges')
 
     if (contentLength) responseHeaders['Content-Length'] = contentLength
     if (contentRange) responseHeaders['Content-Range'] = contentRange
+    if (acceptRanges) responseHeaders['Accept-Ranges'] = acceptRanges
 
     return new NextResponse(response.body, {
       status: response.status,
       headers: responseHeaders,
     })
   } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      return NextResponse.json({ error: 'Request timeout' }, { status: 504 })
+    }
     console.error('[Stream] Error:', error)
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Stream error' },
