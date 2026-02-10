@@ -70,15 +70,22 @@ export default function VavooChannelBrowserUltra() {
     }
   }
 
+  const retryCountRef = useRef(0)
+  const maxNetworkRetries = 3
+
   const playChannel = async (channel: Channel, mode: StreamMode = 'cdn') => {
     setSelectedChannel(channel)
     setPlayError(null)
     setBufferHealth(0)
     setStreamMode(mode)
+    retryCountRef.current = 0
 
     try {
       const encodedUrl = encodeURIComponent(channel.url)
       const proxyUrl = `/api/vavoo-stream-v2?url=${encodedUrl}&mode=${mode}`
+
+      console.log(`[v0] Playing channel: ${channel.name}, mode: ${mode}`)
+      console.log(`[v0] Proxy URL: ${proxyUrl}`)
 
       if (videoRef.current) {
         if (Hls.isSupported()) {
@@ -91,46 +98,45 @@ export default function VavooChannelBrowserUltra() {
             enableWorker: true,
             lowLatencyMode: false,
 
-            // Buffer ultra-optimisé
-            maxBufferLength: 40,              // 40s buffer
-            maxMaxBufferLength: 120,          // Max 120s
-            maxBufferSize: 100 * 1000 * 1000, // 100 MB
-            maxBufferHole: 0.3,
-            backBufferLength: 120,
+            // Buffer optimized
+            maxBufferLength: 30,
+            maxMaxBufferLength: 120,
+            maxBufferSize: 60 * 1000 * 1000,
+            maxBufferHole: 0.5,
+            backBufferLength: 60,
 
-            // Loading très rapide
-            manifestLoadingTimeOut: 10000,
-            manifestLoadingMaxRetry: 3,
-            manifestLoadingRetryDelay: 500,
-            manifestLoadingMaxRetryTimeout: 10000,
+            // Generous timeouts for proxy
+            manifestLoadingTimeOut: 20000,
+            manifestLoadingMaxRetry: 4,
+            manifestLoadingRetryDelay: 1000,
+            manifestLoadingMaxRetryTimeout: 30000,
 
-            levelLoadingTimeOut: 10000,
-            levelLoadingMaxRetry: 3,
-            levelLoadingRetryDelay: 500,
-            levelLoadingMaxRetryTimeout: 10000,
+            levelLoadingTimeOut: 20000,
+            levelLoadingMaxRetry: 4,
+            levelLoadingRetryDelay: 1000,
+            levelLoadingMaxRetryTimeout: 30000,
 
-            fragLoadingTimeOut: 20000,
+            fragLoadingTimeOut: 30000,
             fragLoadingMaxRetry: 6,
-            fragLoadingRetryDelay: 500,
+            fragLoadingRetryDelay: 1000,
             fragLoadingMaxRetryTimeout: 60000,
 
-            // Progressive et prefetch
+            // Progressive loading
             progressive: true,
             startFragPrefetch: true,
 
-            // ABR optimisé
+            // ABR
             startLevel: -1,
             capLevelToPlayerSize: true,
-            abrEwmaDefaultEstimate: 1000000,  // Assume 1 Mbps initially
+            abrEwmaDefaultEstimate: 500000,
             abrBandWidthFactor: 0.90,
             abrBandWidthUpFactor: 0.60,
             abrMaxWithRealBitrate: false,
 
-            // Parallélisation
-            maxLoadingDelay: 2,
+            maxLoadingDelay: 4,
 
             xhrSetup: (xhr) => {
-              xhr.timeout = 20000
+              xhr.timeout = 30000
               xhr.withCredentials = false
             },
           })
@@ -139,14 +145,12 @@ export default function VavooChannelBrowserUltra() {
 
           // Manifest loaded
           hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
-            console.log(`[HLS] Manifest: ${data.levels.length} qualities`)
-            data.levels.forEach((level, i) => {
-              console.log(`  Level ${i}: ${level.width}x${level.height} @ ${(level.bitrate / 1000).toFixed(0)}kbps`)
-            })
+            console.log(`[v0] Manifest parsed: ${data.levels.length} qualities`)
+            retryCountRef.current = 0 // Reset retry count on success
             
             videoRef.current?.play().catch((err) => {
-              console.error('[Play] Error:', err)
-              setPlayError('Cliquez sur ▶ pour démarrer')
+              console.error('[v0] Play error:', err)
+              setPlayError('Cliquez sur le lecteur pour demarrer')
             })
           })
 
@@ -155,54 +159,63 @@ export default function VavooChannelBrowserUltra() {
             const level = hls.levels[data.level]
             const quality = level ? `${level.width}x${level.height}` : 'unknown'
             setCurrentQuality(quality)
-            console.log(`[Quality] Switched to ${quality}`)
           })
 
-          // Fragment loaded
-          let loadCount = 0
-          let totalLoadTime = 0
-          hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
-            loadCount++
-            totalLoadTime += data.stats.loading.end - data.stats.loading.start
-            const avgLoadTime = totalLoadTime / loadCount
-
-            console.log(
-              `[Frag ${data.frag.sn}] ` +
-              `${(data.stats.total / 1024).toFixed(1)}KB in ` +
-              `${(data.stats.loading.end - data.stats.loading.start).toFixed(0)}ms ` +
-              `(avg: ${avgLoadTime.toFixed(0)}ms)`
-            )
+          // Fragment loaded - reset error state on successful load
+          hls.on(Hls.Events.FRAG_LOADED, () => {
+            if (playError) {
+              setPlayError(null)
+            }
+            retryCountRef.current = 0
           })
 
-          // Errors avec récupération intelligente
+          // Error handling with auto-fallback between modes
           hls.on(Hls.Events.ERROR, (event, data) => {
-            console.error('[HLS] Error:', {
+            console.error('[v0] HLS Error:', {
               type: data.type,
               details: data.details,
               fatal: data.fatal,
             })
 
             if (data.fatal) {
+              retryCountRef.current++
+
               switch (data.type) {
                 case Hls.ErrorTypes.NETWORK_ERROR:
-                  console.log('[Recovery] Network error - retrying...')
-                  setPlayError('Erreur réseau - reconnexion...')
-                  setTimeout(() => {
-                    hls.startLoad()
-                    setPlayError(null)
-                  }, 1000)
+                  if (retryCountRef.current <= maxNetworkRetries) {
+                    console.log(`[v0] Network error - retry ${retryCountRef.current}/${maxNetworkRetries}`)
+                    setPlayError(`Erreur reseau - tentative ${retryCountRef.current}/${maxNetworkRetries}...`)
+                    setTimeout(() => {
+                      hls.startLoad()
+                    }, 2000)
+                  } else {
+                    // Auto-fallback to next mode
+                    const fallbackOrder: StreamMode[] = ['cdn', 'auth', 'standard']
+                    const currentIndex = fallbackOrder.indexOf(mode)
+                    const nextMode = fallbackOrder[currentIndex + 1]
+                    
+                    if (nextMode) {
+                      console.log(`[v0] Falling back from ${mode} to ${nextMode}`)
+                      setPlayError(`Mode ${mode} echoue - passage au mode ${nextMode}...`)
+                      hls.destroy()
+                      setTimeout(() => {
+                        playChannel(channel, nextMode)
+                      }, 1000)
+                    } else {
+                      setPlayError('Impossible de lire ce stream. Essayez plus tard.')
+                    }
+                  }
                   break
 
                 case Hls.ErrorTypes.MEDIA_ERROR:
-                  console.log('[Recovery] Media error - recovering...')
-                  setPlayError('Erreur média - récupération...')
+                  console.log('[v0] Media error - recovering...')
+                  setPlayError('Erreur media - recuperation...')
                   hls.recoverMediaError()
                   setTimeout(() => setPlayError(null), 2000)
                   break
 
                 default:
-                  setPlayError(`Erreur fatale: ${data.details}`)
-                  console.error('[Fatal]', data)
+                  setPlayError(`Erreur: ${data.details}`)
                   break
               }
             }
